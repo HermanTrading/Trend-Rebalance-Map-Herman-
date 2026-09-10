@@ -1,0 +1,426 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © HermanTrading 
+
+//@version=6
+
+// ═════════════════════════════════════════════════════════════
+//  TREND REBALANCE MAP [Herman]  ·  v1.1  ·  open source
+// ═════════════════════════════════════════════════════════════
+//  WHAT IT DOES
+//  Rebalance entry against a stretched moving-average pair: price
+//  closes back across the fast SMA in the direction of the slow SMA,
+//  but only while the two averages are separated by at least a
+//  user-defined distance in points. One position at a time; opposite
+//  signals are ignored while a trade is open.
+//
+//  PINE VERSION NOTES
+//  Written in Pine Script v6 (strict bool, no implicit casting).
+//  No plan-gated or preview API is used on purpose — no footprint
+//  requests, no dynamic requests, no security calls — so the
+//  published source compiles and runs for every user on every plan.
+//  strategy.exit() is called with absolute stop / limit levels only,
+//  therefore the 2026 change to mixed absolute + relative exit
+//  parameters cannot alter how this engine fills.
+//
+//  REPAINT STATEMENT
+//  - No request.security(), no higher-timeframe data, no lookahead.
+//  - Signals require barstate.isconfirmed: a signal can only print on
+//    a closed bar and never disappears afterwards.
+//  - process_orders_on_close = true: fills are modelled at the close
+//    of the signal bar. History and real time follow the same rule.
+//  - In "Dynamic" mode the 200 SMA target moves while a trade is
+//    open by design; already-closed bars are never rewritten.
+// ═════════════════════════════════════════════════════════════
+
+strategy(
+     "Trend Rebalance Map [Herman]",
+   
+     overlay                 = true,
+     pyramiding              = 0,
+     process_orders_on_close = true,
+     calc_on_every_tick      = false,
+     initial_capital         = 100000,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 1,
+     commission_type         = strategy.commission.cash_per_contract,
+     commission_value        = 2.5,
+     slippage                = 2
+     )
+
+// ═════════════════════════════════════════════════════════════
+// INPUT GROUPS
+// ═════════════════════════════════════════════════════════════
+string G_SIG = "Signal Settings"
+string G_DIR = "Trade Direction"
+string G_TP  = "Take Profit"
+string G_SL  = "Stop Loss"
+string G_VIS = "Visuals"
+string G_COL = "Colors"
+string G_TBL = "Statistics Table"
+
+// ═════════════════════════════════════════════════════════════
+// SIGNAL INPUTS
+// ═════════════════════════════════════════════════════════════
+sma50Length   = input.int(50, "50SMA Length", minval = 1, group = G_SIG,
+                 tooltip = "Fast average. Price closing across it is the trigger.")
+sma200Length  = input.int(200, "200SMA Length", minval = 1, group = G_SIG,
+                 tooltip = "Slow average. Defines the direction the trade is taken in and, optionally, the target.")
+pointSize     = input.float(1.0, "Price Units Per Point", minval = 0.0000001, step = 0.01, group = G_SIG,
+                 tooltip = "How many price units make one 'point' on this symbol. 1.0 for index futures such as NQ/MNQ. Every points-based input below is converted with this value.")
+minSeparation = input.float(30.0, "Minimum Separation (Points)", minval = 0.0, step = 0.1, group = G_SIG,
+                 tooltip = "Signals are only taken when the distance between the two averages exceeds this value. Filters out flat, entangled markets.")
+
+enableLongs   = input.bool(true, "Enable LONGS", group = G_DIR)
+enableShorts  = input.bool(true, "Enable SHORTS", group = G_DIR)
+
+// ═════════════════════════════════════════════════════════════
+// TP / SL INPUTS
+// ═════════════════════════════════════════════════════════════
+tpMode = input.string(
+     "200 SMA",
+     "Take Profit Mode",
+     options = ["200 SMA", "Fixed Points"],
+     tooltip = "200 SMA = target the slow average. Fixed Points = target a constant distance from entry.",
+     group   = G_TP
+     )
+
+smaTargetBehaviour = input.string(
+     "Dynamic",
+     "200 SMA Target Behaviour",
+     options = ["Locked at Entry", "Dynamic"],
+     tooltip = "Locked at Entry = TP is the 200 SMA value when the signal/entry occurs. Dynamic = TP follows the current 200 SMA while the trade is open.",
+     group   = G_TP
+     )
+
+tpFixedPoints = input.float(
+     100.0,
+     "TP Fixed Points",
+     minval  = 0.1,
+     step    = 0.25,
+     tooltip = "Used only when Take Profit Mode = Fixed Points.",
+     group   = G_TP
+     )
+
+slMode = input.string(
+     "Fixed Points",
+     "Stop Loss Mode",
+     options = ["1R to TP", "Fixed Points"],
+     tooltip = "1R to TP = SL distance equals the distance from entry to the initial TP at the moment of entry.",
+     group   = G_SL
+     )
+
+slFixedPoints = input.float(
+     125.0,
+     "SL Fixed Points",
+     minval  = 0.1,
+     step    = 0.25,
+     tooltip = "Used only when Stop Loss Mode = Fixed Points.",
+     group   = G_SL
+     )
+
+// ═════════════════════════════════════════════════════════════
+// VISUAL INPUTS
+// ═════════════════════════════════════════════════════════════
+showLabels      = input.bool(true, "Show LONG/SHORT Labels", group = G_VIS)
+showTradeLevels = input.bool(true, "Show Entry / SL / TP", group = G_VIS)
+showSmaPlots    = input.bool(true, "Show 50 / 200 SMA", group = G_VIS)
+
+colSma50  = input.color(color.yellow,           "50 SMA",       group = G_COL)
+colSma200 = input.color(color.rgb(0, 100, 0),   "200 SMA",      group = G_COL)
+colLong   = input.color(color.rgb(0, 170, 80),  "Long Signal",  group = G_COL)
+colShort  = input.color(color.rgb(220, 40, 55), "Short Signal", group = G_COL)
+colEntry  = input.color(#e040fb,                "Trade Entry",  group = G_COL)
+colStop   = input.color(#ef5350,                "Stop Loss",    group = G_COL)
+colTarget = input.color(#81c784,                "Take Profit",  group = G_COL)
+
+// ═════════════════════════════════════════════════════════════
+// STATISTICS TABLE INPUTS
+// ═════════════════════════════════════════════════════════════
+showTable  = input.bool(true, "Show Table", group = G_TBL)
+tableTheme = input.string("Light", "Theme", options = ["Dark", "Light"], group = G_TBL)
+tableSize  = input.string("small", "Size",
+             options = ["tiny", "small", "normal", "large"], group = G_TBL)
+tablePos   = input.string(position.top_right, "Position",
+             options = [position.top_right, position.bottom_right,
+                        position.top_left,  position.bottom_left], group = G_TBL)
+
+// ═════════════════════════════════════════════════════════════
+// TABLE PALETTE
+// ═════════════════════════════════════════════════════════════
+var color c_green = na, var color c_red  = na
+var color c_nbg   = na, var color c_ntxt = na
+var color c_hdr   = na, var color c_dhdr = na
+var color c_sep   = na
+
+if tableTheme == "Dark"
+    c_green := #29a071, c_red  := #e54b4b
+    c_nbg   := #2a2e39, c_ntxt := #e0e0e0
+    c_hdr   := #3c415e, c_dhdr := #525a81
+    c_sep   := #454955
+else
+    c_green := #29a071, c_red  := #e54b4b
+    c_nbg   := #f7f7f7, c_ntxt := #1e2025
+    c_hdr   := #e5eef7, c_dhdr := #dfe2f1
+    c_sep   := #e1e4e6
+
+color nbg2 = color.new(c_nbg, 50)
+
+font_sz(sz) =>
+    switch sz
+        "tiny"   => size.tiny
+        "small"  => size.small
+        "normal" => size.normal
+        "large"  => size.large
+        =>           size.small
+
+// ═════════════════════════════════════════════════════════════
+// SMA CALCULATIONS
+// ═════════════════════════════════════════════════════════════
+sma50  = ta.sma(close, sma50Length)
+sma200 = ta.sma(close, sma200Length)
+
+plot(showSmaPlots ? sma50  : na, title = "50 SMA",  color = colSma50,  linewidth = 2, style = plot.style_cross)
+plot(showSmaPlots ? sma200 : na, title = "200 SMA", color = colSma200, linewidth = 2, style = plot.style_cross)
+
+// ═════════════════════════════════════════════════════════════
+// SIGNAL LOGIC  —  engine unchanged
+// barstate.isconfirmed keeps every signal bound to a closed bar.
+// ═════════════════════════════════════════════════════════════
+bullishCross = ta.crossover(close, sma50)  and barstate.isconfirmed
+bearishCross = ta.crossunder(close, sma50) and barstate.isconfirmed
+
+longDirection  = sma50 < sma200
+shortDirection = sma50 > sma200
+
+rawSeparation    = math.abs(sma50 - sma200)
+separationPoints = rawSeparation / pointSize
+separationPass   = separationPoints > minSeparation
+
+longSignal  = bullishCross and longDirection  and separationPass
+shortSignal = bearishCross and shortDirection and separationPass
+
+plotshape(
+     showLabels and longSignal,
+     title     = "LongSMA",
+     style     = shape.triangleup,
+     location  = location.belowbar,
+     color     = colLong,
+     text      = "LongSMA",
+     textcolor = color.white,
+     size      = size.small
+     )
+
+plotshape(
+     showLabels and shortSignal,
+     title     = "ShortSMA",
+     style     = shape.triangledown,
+     location  = location.abovebar,
+     color     = colShort,
+     text      = "ShortSMA",
+     textcolor = color.white,
+     size      = size.small
+     )
+
+// ═════════════════════════════════════════════════════════════
+// TRADE STATE
+// Only ONE trade at a time. Opposite signals are ignored while a
+// position is open. No entry on the bar a trade was closed.
+// ═════════════════════════════════════════════════════════════
+var float activeEntry     = na
+var float activeSL        = na
+var float activeTPAtEntry = na
+var int   activeSide      = 0
+var int   lastEntryBar    = na
+var int   lastExitBar     = na
+
+justClosed = strategy.position_size == 0 and nz(strategy.position_size[1]) != 0
+
+if justClosed
+    lastExitBar     := bar_index
+    activeEntry     := na
+    activeSL        := na
+    activeTPAtEntry := na
+    activeSide      := 0
+
+flat = strategy.position_size == 0
+
+canEnter =
+     flat and
+     (na(lastEntryBar) or bar_index != lastEntryBar) and
+     (na(lastExitBar)  or bar_index != lastExitBar)
+
+// ═════════════════════════════════════════════════════════════
+// LONG ENTRY
+// NOTE: with Take Profit Mode = "200 SMA" the target is wherever the
+// slow average sits. If price has already travelled past the 200 SMA
+// on the signal bar, the initial target lands on the wrong side of
+// entry and the exit resolves immediately. Rare, but it is the one
+// edge case of this target model.
+// ═════════════════════════════════════════════════════════════
+executeLong = enableLongs and longSignal and canEnter
+
+if executeLong
+    float entryReference = close
+
+    float initialTP =
+         tpMode == "200 SMA" ?
+         sma200 :
+         entryReference + (tpFixedPoints * pointSize)
+
+    float initialTargetDistance = math.abs(initialTP - entryReference)
+
+    float calculatedSL =
+         slMode == "1R to TP" ?
+         entryReference - initialTargetDistance :
+         entryReference - (slFixedPoints * pointSize)
+
+    activeEntry     := entryReference
+    activeTPAtEntry := initialTP
+    activeSL        := calculatedSL
+    activeSide      := 1
+    lastEntryBar    := bar_index
+
+    strategy.entry("Long", strategy.long)
+
+// ═════════════════════════════════════════════════════════════
+// SHORT ENTRY
+// ═════════════════════════════════════════════════════════════
+executeShort = enableShorts and shortSignal and canEnter
+
+if executeShort
+    float entryReference = close
+
+    float initialTP =
+         tpMode == "200 SMA" ?
+         sma200 :
+         entryReference - (tpFixedPoints * pointSize)
+
+    float initialTargetDistance = math.abs(entryReference - initialTP)
+
+    float calculatedSL =
+         slMode == "1R to TP" ?
+         entryReference + initialTargetDistance :
+         entryReference + (slFixedPoints * pointSize)
+
+    activeEntry     := entryReference
+    activeTPAtEntry := initialTP
+    activeSL        := calculatedSL
+    activeSide      := -1
+    lastEntryBar    := bar_index
+
+    strategy.entry("Short", strategy.short)
+
+// ═════════════════════════════════════════════════════════════
+// ACTIVE TARGET
+// ═════════════════════════════════════════════════════════════
+float activeTP = activeTPAtEntry
+
+if activeSide != 0 and tpMode == "200 SMA" and smaTargetBehaviour == "Dynamic"
+    activeTP := sma200
+
+// ═════════════════════════════════════════════════════════════
+// EXITS
+// ═════════════════════════════════════════════════════════════
+if activeSide == 1 and not na(activeSL) and not na(activeTP)
+    strategy.exit("Long Exit", from_entry = "Long", stop = activeSL, limit = activeTP)
+
+if activeSide == -1 and not na(activeSL) and not na(activeTP)
+    strategy.exit("Short Exit", from_entry = "Short", stop = activeSL, limit = activeTP)
+
+// ═════════════════════════════════════════════════════════════
+// TRADE LEVEL VISUALS
+// ═════════════════════════════════════════════════════════════
+plot(
+     showTradeLevels and activeSide != 0 ? activeEntry : na,
+     title     = "Trade Entry",
+     color     = colEntry,
+     linewidth = 2,
+     style     = plot.style_linebr
+     )
+
+plot(
+     showTradeLevels and activeSide != 0 ? activeSL : na,
+     title     = "Stop Loss",
+     color     = colStop,
+     linewidth = 2,
+     style     = plot.style_linebr
+     )
+
+plot(
+     showTradeLevels and activeSide != 0 ? activeTP : na,
+     title     = "Take Profit",
+     color     = colTarget,
+     linewidth = 2,
+     style     = plot.style_linebr
+     )
+
+// ═════════════════════════════════════════════════════════════
+// PERFORMANCE STATISTICS
+// Closed trades only, taken straight from the broker emulator, so
+// the table always agrees with the Strategy Tester.
+// ═════════════════════════════════════════════════════════════
+int   nTrades = strategy.closedtrades
+int   nWins   = strategy.wintrades
+int   nLosses = strategy.losstrades
+float grossP  = strategy.grossprofit
+float grossL  = strategy.grossloss
+
+float winRate = nTrades > 0 ? 100.0 * nWins / nTrades : na
+float profFac = grossL > 0 ? grossP / grossL : na
+
+string sTrades  = str.tostring(nTrades)
+string sWins    = str.tostring(nWins)
+string sLosses  = str.tostring(nLosses)
+string sWinRate = nTrades > 0 ? str.tostring(winRate, "#.##") + " %" : "—"
+string sProfFac = grossL > 0 ? str.tostring(profFac, "#.##") : (grossP > 0 ? "∞" : "—")
+
+color cProfFac = grossL > 0 ? (profFac >= 1.0 ? c_green : c_red) : c_ntxt
+
+// ═════════════════════════════════════════════════════════════
+// STATISTICS TABLE
+// ═════════════════════════════════════════════════════════════
+if showTable and barstate.islast
+    tbl = table.new(tablePos, 2, 7,
+         bgcolor = c_nbg, border_width = 1, frame_width = 1,
+         border_color = c_sep, frame_color = c_sep)
+    string fsz = font_sz(tableSize)
+    int r = 0
+
+    table.cell(tbl, 0, r, "Trend Rebalance Map  [Herman]",
+         text_color = c_ntxt, bgcolor = c_hdr, text_size = fsz)
+    table.cell(tbl, 1, r, "", text_color = c_ntxt, bgcolor = c_hdr), r += 1
+
+    table.cell(tbl, 0, r, "Performance",
+         text_color = c_ntxt, bgcolor = c_dhdr, text_size = fsz)
+    table.cell(tbl, 1, r, "", bgcolor = c_dhdr), r += 1
+
+    table.cell(tbl, 0, r, "Trades",
+         bgcolor = nbg2, text_color = c_ntxt, text_size = fsz)
+    table.cell(tbl, 1, r, sTrades,
+         bgcolor = nbg2, text_color = c_ntxt, text_size = fsz), r += 1
+
+    table.cell(tbl, 0, r, "Wins",
+         bgcolor = c_nbg, text_color = c_ntxt, text_size = fsz)
+    table.cell(tbl, 1, r, sWins,
+         bgcolor = c_nbg, text_color = c_green, text_size = fsz), r += 1
+
+    table.cell(tbl, 0, r, "Losses",
+         bgcolor = nbg2, text_color = c_ntxt, text_size = fsz)
+    table.cell(tbl, 1, r, sLosses,
+         bgcolor = nbg2, text_color = c_red, text_size = fsz), r += 1
+
+    table.cell(tbl, 0, r, "Win Rate",
+         bgcolor = c_nbg, text_color = c_ntxt, text_size = fsz)
+    table.cell(tbl, 1, r, sWinRate,
+         bgcolor = c_nbg, text_color = c_ntxt, text_size = fsz), r += 1
+
+    table.cell(tbl, 0, r, "Profit Factor",
+         bgcolor = nbg2, text_color = c_ntxt, text_size = fsz)
+    table.cell(tbl, 1, r, sProfFac,
+         bgcolor = nbg2, text_color = cProfFac, text_size = fsz), r += 1
+
+// ═════════════════════════════════════════════════════════════
+// ALERTS
+// ═════════════════════════════════════════════════════════════
+alertcondition(longSignal,  title = "LongSMA",  message = "LongSMA: all conditions confirmed on the close.")
+alertcondition(shortSignal, title = "ShortSMA", message = "ShortSMA: all conditions confirmed on the close.")
